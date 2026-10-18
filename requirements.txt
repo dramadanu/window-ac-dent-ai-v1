@@ -1,0 +1,8 @@
+torch>=2.2
+torchvision>=0.17
+opencv-python>=4.9
+Pillow>=10.0
+numpy>=1.26
+streamlit>=1.32
+pandas>=2.1
+plotly>=5.19

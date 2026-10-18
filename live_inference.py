@@ -1,17 +1,20 @@
+"""Live inspection V2:  camera -> (1) find condenser box -> (2) classify the crop -> OK / NG -> count once per unit."""
 import argparse
-import time
 from datetime import datetime
 from pathlib import Path
 
 import cv2
 import torch
 from PIL import Image
-from torchvision import models, transforms
 from torch import nn
+from torchvision import models, transforms
 
-from common import init_db, log_inspection, SNAPSHOT_DIR
+from common import init_db, log_inspection, counts_today, SNAPSHOT_DIR
+from detector import load_detector, crop_box
+from inspector import UnitTracker, Counters, draw_overlay, OK, NG, REVIEW, UNDETECTED
 
-def load_model(model_path, device):
+
+def load_classifier(model_path, device):
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     classes = checkpoint["class_names"]
     model = models.mobilenet_v3_small(weights=None)
@@ -25,70 +28,104 @@ def load_model(model_path, device):
     ])
     return model, classes, tf
 
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--camera", type=int, default=0)
-    p.add_argument("--interval", type=float, default=1.0, help="Minimum seconds between logged predictions")
-    p.add_argument("--confidence", type=float, default=0.75)
-    p.add_argument("--model", default="models/dent_model.pth")
+    p.add_argument("--model", default="models/dent_model.pth", help="dent classifier")
+    p.add_argument("--detector", default="auto", choices=["auto", "heuristic", "learned"])
+    p.add_argument("--detector-model", default="models/condenser_detector.pth")
+    p.add_argument("--det-threshold", type=float, default=0.6, help="min detector confidence (learned detector)")
+    p.add_argument("--confidence", type=float, default=0.75, help="min classifier confidence, else REVIEW")
+    p.add_argument("--min-frames", type=int, default=5, help="frames to wait after condenser appears")
+    p.add_argument("--vote-frames", type=int, default=10, help="frames averaged for the final decision")
+    p.add_argument("--lost-frames", type=int, default=15, help="frames without condenser before the unit is released")
+    p.add_argument("--detect-every", type=int, default=1, help="run the detector every N frames (raise if slow)")
+    p.add_argument("--resume", action="store_true", help="start counters from today's logged totals")
     args = p.parse_args()
+
     if not Path(args.model).exists():
-        raise SystemExit(f"Model not found: {args.model}. Follow README to capture data and train first.")
+        raise SystemExit(f"Classifier not found: {args.model}. Run prepare_dataset.py and train.py first.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, classes, tf = load_model(args.model, device)
+    model, classes, tf = load_classifier(args.model, device)
+    detector = load_detector(args.detector, args.detector_model, args.det_threshold)
     init_db()
+
+    tracker = UnitTracker(classes, args.confidence, args.min_frames, args.vote_frames, args.lost_frames)
+    counters = Counters()
+    if args.resume:
+        for status, n in counts_today().items():
+            counters.total += n
+            if status == OK:
+                counters.ok += n
+            elif status == NG:
+                counters.ng += n
+            elif status == REVIEW:
+                counters.review += n
+
     cap = cv2.VideoCapture(args.camera)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     if not cap.isOpened():
         raise SystemExit("Cannot open camera. Try --camera 1 or close other camera apps.")
-    last_log = 0.0
-    last_result = ("WAITING", 0.0, "WAITING")
-    print("Live inference running. q=quit, s=save snapshot (without logging another record).")
+
+    print(f"Detector: {detector.name} | classes: {classes}")
+    print("q=quit | s=snapshot | n=re-inspect current unit | r=reset session counters")
+    frame_idx, last_det = 0, None
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 print("Could not read frame.")
                 break
-            now = time.monotonic()
-            if now - last_log >= max(args.interval, 0.1):
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            if frame_idx % max(args.detect_every, 1) == 0:
+                last_det = detector.detect(frame)
+            frame_idx += 1
+            det = last_det
+
+            def classify():
+                crop = crop_box(frame, det.box)
+                rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
                 tensor = tf(Image.fromarray(rgb)).unsqueeze(0).to(device)
                 with torch.no_grad():
-                    probs = torch.softmax(model(tensor), dim=1)[0]
-                idx = int(probs.argmax().item())
-                prediction = classes[idx]
-                confidence = float(probs[idx].item())
-                status = prediction.upper() if confidence >= args.confidence else "REVIEW"
-                last_result = (prediction.upper(), confidence, status)
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                img_path = SNAPSHOT_DIR / f"{stamp}_{status.lower()}.jpg"
-                cv2.imwrite(str(img_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-                log_inspection(prediction.upper(), confidence, status, img_path)
-                last_log = now
+                    return torch.softmax(model(tensor), dim=1)[0].cpu().numpy()
 
-            pred, conf, status = last_result
-            color = (40, 200, 40) if status == "GOOD" else (30, 30, 230) if status in ("DENT", "NG") else (0, 190, 255)
-            cv2.rectangle(frame, (10, 10), (620, 115), (20, 20, 20), -1)
-            cv2.putText(frame, f"Prediction: {pred} | Decision: {status}", (25, 48),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            cv2.putText(frame, f"Confidence: {conf:.1%} | Log interval: {args.interval:.1f}s",
-                        (25, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1)
-            cv2.putText(frame, "q=quit | s=snapshot", (20, frame.shape[0]-20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-            cv2.imshow("Window AC Condenser - AI Visual Inspection V1", frame)
+            event = tracker.update(det, classify)
+            if event:                                   # unit finished: count + log exactly once
+                counters.add(event["status"])
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                evidence = frame.copy()
+                x1, y1, x2, y2 = event["box"]
+                cv2.rectangle(evidence, (x1, y1), (x2, y2), (0, 255, 255), 3)
+                cv2.putText(evidence, f"{event['status']} {event['confidence']:.0%}", (x1 + 8, y1 + 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+                img_path = SNAPSHOT_DIR / f"{stamp}_{event['status'].lower()}.jpg"
+                cv2.imwrite(str(img_path), evidence, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+                log_inspection(event["prediction"], event["confidence"], event["status"], img_path,
+                               source="webcam_unit", det_score=event["det_score"],
+                               box=event["box"], votes=event["votes"])
+                print(f"[{counters.total}] {event['status']} ({event['confidence']:.1%}) "
+                      f"| OK={counters.ok} NG={counters.ng} REVIEW={counters.review}")
+
+            view = frame.copy()
+            draw_overlay(view, tracker, counters, detector.name, "q quit | s snap | n re-inspect | r reset")
+            cv2.imshow("Window AC Condenser - AI Visual Inspection V2", view)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
-            if key == ord("s"):
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                path = SNAPSHOT_DIR / f"manual_{stamp}.jpg"
-                cv2.imwrite(str(path), frame)
+            elif key == ord("s"):
+                path = SNAPSHOT_DIR / f"manual_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+                cv2.imwrite(str(path), view)
                 print(f"Snapshot saved: {path}")
+            elif key == ord("n"):
+                tracker.reset()
+            elif key == ord("r"):
+                counters.reset()
+                print("Session counters reset.")
     finally:
         cap.release()
         cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
